@@ -5,8 +5,12 @@
 #include <cmath>
 #include <stdio.h>
 
+#include "sorting.cuh"
+
+
 
 #define MAX_G_PER_TILE 512  // compile-time upper bound, must be >= max_G_per_tile used from Python
+#define MAX_K 100
 
 
 // ============================================================
@@ -112,6 +116,7 @@ __device__ inline void gaussian_gradients(
 
     dtheta = dM00*dm00_dtheta + 2*dM01*dm01_dtheta + dM11*dm11_dtheta;
 }
+
 
 
 // CUDA kernel for tile-Gaussian correspondence
@@ -246,30 +251,20 @@ __global__ void renderTile(
         g_colors[i * 3 + 2] = gaussian_colors[g * 3 + 2];
     }
 
-    //top-K selection (naive O(n^2) sort)
-    for (int i = 0; i < count; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (g_values[i] < g_values[j]) {
-                // Swap g_values
-                float temp_val = g_values[i];
-                g_values[i] = g_values[j];
-                g_values[j] = temp_val;
+    // Option A: naive O(n^2)
+    // naive_sort(g_values, g_colors, count);
 
-                // Swap g_colors
-                float temp_color0 = g_colors[i * 3 + 0];
-                g_colors[i * 3 + 0] = g_colors[j * 3 + 0];
-                g_colors[j * 3 + 0] = temp_color0;
+    // Option B: heap-based Top-K
+    //heap_topk(g_values, g_colors, count, K);
 
-                float temp_color1 = g_colors[i * 3 + 1];
-                g_colors[i * 3 + 1] = g_colors[j * 3 + 1];
-                g_colors[j * 3 + 1] = temp_color1;
+    // Option C: Bitonic TopK
+    bitonic_topk(g_values, g_colors, count, K);
 
-                float temp_color2 = g_colors[i * 3 + 2];
-                g_colors[i * 3 + 2] = g_colors[j * 3 + 2];
-                g_colors[j * 3 + 2] = temp_color2;
-            }
-        }
-    }
+    // Option D: QuickSelect
+    //quickselect_topk(g_values, g_colors, count, K);
+
+    int topK_indices[MAX_K];
+
         
     // Aggregate colors
     int useK = min(K,count);
@@ -382,7 +377,17 @@ __global__ void renderTileBackward(
 
     // Sort descending by val (naive)
     for(int i=0;i<count;i++)for(int j=i+1;j<count;j++)if(gs[i].val<gs[j].val){auto t=gs[i];gs[i]=gs[j];gs[j]=t;}
-    
+    // Option A: naive O(n^2)
+    // naive_sort(g_values, g_colors, count);
+
+    // Option B: heap-based Top-K
+    //heap_topk(g_values, g_colors, count, K);
+
+    // Option C: Bitonic TopK
+    // bitonic_topk(g_values, g_colors, count, K);
+
+    // Option D: QuickSelect
+    //quickselect_topk(g_values, g_colors, count, K);
 
     // Aggregate colors and compute gradients
     int useK = min(K,count);

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Function
-import gaussian_renderer_cuda # type: ignore
+import cuda_engine.gaussian_renderer_cuda as renderer  # type: ignore
 
 class GaussianRendererFunction(Function):
     @staticmethod
@@ -15,7 +15,7 @@ class GaussianRendererFunction(Function):
         output_image = torch.zeros(H, W, 3, device=gaussian_means.device)
 
         # Call CUDA kernels
-        gaussian_renderer_cuda.find_tile_gaussian_correspondence(
+        renderer.find_tile_gaussian_correspondence(
             gaussian_means.contiguous(),
             gaussian_rotations.contiguous(),
             gaussian_log_scales.contiguous(),
@@ -29,7 +29,7 @@ class GaussianRendererFunction(Function):
             max_G_per_tile
         )
 
-        gaussian_renderer_cuda.render_tile(
+        renderer.render_tile(
             gaussian_means.contiguous(),
             gaussian_rotations.contiguous(),
             gaussian_log_scales.contiguous(),
@@ -65,7 +65,7 @@ class GaussianRendererFunction(Function):
         grad_colors = torch.zeros_like(gaussian_colors)
 
         # Call CUDA kernels for backward pass
-        gaussian_renderer_cuda.render_tile_backward(
+        renderer.render_tile_backward(
             grad_output.contiguous(),
             gaussian_means.contiguous(),
             gaussian_rotations.contiguous(),

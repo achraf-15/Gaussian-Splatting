@@ -138,7 +138,11 @@ class ImageGSOptimizer:
 
             # Clamp physically valid ranges
             with torch.no_grad():
+                # inv_scales should be positive (paper uses 1/s). Clamp to avoid sign flips.
+                #inv_scales.clamp_(min=1e-4, max=1.0)  # min corresponds to large s, max to s=1
+                # rotations in [0, pi]
                 rotations[:] = torch.remainder(rotations, math.pi)
+                 # colors in [0,1]
                 colors.clamp_(0.0,1.0)
 
             # Progressive addition
