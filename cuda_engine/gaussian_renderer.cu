@@ -7,8 +7,6 @@
 
 #include "sorting.cuh"
 
-
-
 #define MAX_G_PER_TILE 128  // compile-time upper bound, must be >= max_G_per_tile used from Python
 #define MAX_K 100
 
@@ -234,63 +232,74 @@ __global__ void renderTile(
 
     const int* g_indices = &tile_gaussian_indices[tile_idx * max_G_per_tile];
 
-    // local buffers (assuming count ≤ max_G_per_tile)
-    //extern __shared__ float shared[];
-    //float* g_values = shared;
-    //float* g_colors = g_values + max_G_per_tile;
+    extern __shared__ float sdata[]; // size in bytes set by kernel launch
+    float* s_mu     = sdata;                                           // 2 * max
+    float* s_theta  = s_mu     + 2 * max_G_per_tile;                   // 1 * max
+    float* s_inv    = s_theta  +    max_G_per_tile;                    // 2 * max
+    float* s_col    = s_inv    + 2 * max_G_per_tile;                   // 3 * max
 
-    // CHANGED: per-thread local buffers (safe, no races).
-    // WARNING: this uses register/local memory. If max_G_per_tile is large, this may spill to local memory.
-    // Consider reducing max_G_per_tile or implementing chunked evaluation.
-    float g_values[MAX_G_PER_TILE];          // MAX_G_PER_TILE compile-time limit
-    float g_colors[MAX_G_PER_TILE * 3];
-
-    // Evaluate Gaussians in this tile for this pixel (DEBUG GUARDS)
-    for (int i = 0; i < count; ++i) {
+    // Cooperative load of tile Gaussians into shared memory; Each thread in the block participates in loading the count Gaussians into shared memory 
+    int blockThreads = blockDim.x * blockDim.y;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    for (int i = tid; i < count; i += blockThreads) {
         int g = g_indices[i];
-
-        // Defensive check: g must be in [0, N_g) 
+        // defensive: invalid g -> write zeros
         if (g < 0 || g >= N_g) {
             printf("renderTile: BAD_G_INDEX g=%d at tile_idx=%d pixel=(%d,%d) count=%d N_g=%d n_tiles_x=%d\\n",
                    g, tile_idx, x, y, count, N_g, n_tiles_x);
-            // set safe zero values
-            g_values[i] = 0.0f;
-            g_colors[i * 3 + 0] = 0.0f;
-            g_colors[i * 3 + 1] = 0.0f;
-            g_colors[i * 3 + 2] = 0.0f;
-            continue;
-        }
+            s_mu[i*2 + 0] = 0.0f;
+            s_mu[i*2 + 1] = 0.0f;
+            s_theta[i]    = 0.0f;
+            s_inv[i*2 + 0]= 0.0f;
+            s_inv[i*2 + 1]= 0.0f;
+            s_col[i*3 + 0]= 0.0f;
+            s_col[i*3 + 1]= 0.0f;
+            s_col[i*3 + 2]= 0.0f;
+        } else {
+            // load mean & rotation & log-scales (compute inv)
+            float mu_x = gaussian_means[g*2 + 0];
+            float mu_y = gaussian_means[g*2 + 1];
+            float theta = gaussian_rotations[g];
+            float log_sx = gaussian_log_scales[g*2 + 0];
+            float log_sy = gaussian_log_scales[g*2 + 1];
+            float sx = expf(log_sx);
+            float sy = expf(log_sy);
+            float inv_sx = 1.0f / sx;
+            float inv_sy = 1.0f / sy;
 
-        // Normal (safe) code path
-        float mu_x = gaussian_means[g * 2 + 0];
-        float mu_y = gaussian_means[g * 2 + 1];
-        float theta = gaussian_rotations[g];
-        
-        float log_sx = gaussian_log_scales[g * 2 + 0];
-        float log_sy = gaussian_log_scales[g * 2 + 1];
-        float sx = expf(log_sx);
-        float sy = expf(log_sy);
-        float inv_sx = 1.0f / sx;
-        float inv_sy = 1.0f / sy;
+            s_mu[i*2 + 0] = mu_x;
+            s_mu[i*2 + 1] = mu_y;
+            s_theta[i]    = theta;
+            s_inv[i*2 + 0]= inv_sx;
+            s_inv[i*2 + 1]= inv_sy;
+            s_col[i*3 + 0]= gaussian_colors[g*3 + 0];
+            s_col[i*3 + 1]= gaussian_colors[g*3 + 1];
+            s_col[i*3 + 2]= gaussian_colors[g*3 + 2];
+        }
+    }
+    __syncthreads(); // all shared data loaded
+
+
+    float g_values[MAX_G_PER_TILE];          // MAX_G_PER_TILE compile-time limit
+    float g_colors[MAX_G_PER_TILE * 3];
+    
+    // Evaluate Gaussians in this tile for this pixel (DEBUG GUARDS)
+    for (int i = 0; i < count; ++i) {
+        // read parameters from shared memory (cheap)
+        float mu_x = s_mu[i*2 + 0];
+        float mu_y = s_mu[i*2 + 1];
+        float theta = s_theta[i];
+        float inv_sx = s_inv[i*2 + 0];
+        float inv_sy = s_inv[i*2 + 1];
 
         float val = gaussian_eval((float)x, (float)y, mu_x, mu_y, theta, inv_sx, inv_sy);
         g_values[i] = val;
-        g_colors[i * 3 + 0] = gaussian_colors[g * 3 + 0];
-        g_colors[i * 3 + 1] = gaussian_colors[g * 3 + 1];
-        g_colors[i * 3 + 2] = gaussian_colors[g * 3 + 2];
+
+        // copy color from shared memory into per-thread local array (topk_selector expects writable colors)
+        g_colors[i*3 + 0] = s_col[i*3 + 0];
+        g_colors[i*3 + 1] = s_col[i*3 + 1];
+        g_colors[i*3 + 2] = s_col[i*3 + 2];
     }
-
-    // Option A: naive O(n^2)
-    // naive_sort(g_values, g_colors, count);
-
-    // Option B: heap-based Top-K
-    //heap_topk(g_values, g_colors, count, K);
-
-    // Option C: Bitonic TopK
-    // bitonic_topk(g_values, g_colors, count, K);
-
-    // Option D: QuickSelect
-    //quickselect_topk(g_values, g_colors, count, K);
 
     int topK_indices[MAX_G_PER_TILE]; // temporary local storage
     topk_selector(g_values, g_colors, topK_indices, count, K, 2); // 0=naive, 1=heap, 2=bitonic, 3=quickselect
@@ -308,11 +317,8 @@ __global__ void renderTile(
         }
         pixel_topk_ptr[i] = local_idx; // store local index, NOT global
     }
-
-
-        
+ 
     // Aggregate colors
-    //int useK = min(K,count);
     float sum_weights = 0.0f;
     float sum_colors[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < useK; i++) {
@@ -372,76 +378,72 @@ __global__ void renderTileBackward(
 
     const int* g_indices = &tile_gaussian_indices[tile_idx * max_G_per_tile];
 
-    // temporary store per-tile values (stack allocation with compile-time bound)
-    struct Gtmp {float val; int idx; float col[3]; float mu_x,mu_y,theta,inv_sx,inv_sy;};
-    Gtmp gs[MAX_G_PER_TILE]; // assume max_G_per_tile <=MAX_G_PER_TILE
+    extern __shared__ char s_mem[]; // allocated at launch in bytes
+    float* s_f = (float*) s_mem; // pointer to float area
+    float* s_mu    = s_f;                                        // 2 * max
+    float* s_theta = s_mu    + 2 * max_G_per_tile;               // 1 * max
+    float* s_inv   = s_theta +    max_G_per_tile;               // 2 * max
+    float* s_col   = s_inv    + 2 * max_G_per_tile;             // 3 * max
+    int*   s_idx   = (int*)(s_col + 3 * max_G_per_tile);        // int area (max entries)
 
-    for (int i = 0; i < count; i++) {
-        int g=g_indices[i];
-        
+    // Cooperative load tile parameters into shared memory
+    int blockThreads = blockDim.x * blockDim.y;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    for (int i = tid; i < count; i += blockThreads) {
+        int g = g_indices[i];
         if (g < 0 || g >= N_g) {
-            printf("renderTileBackward 1: BAD_G_INDEX g=%d tile_idx=%d pixel=(%d,%d) count=%d N_g=%d\\n",
-                   g, tile_idx, x, y, count, N_g);
-            // mark invalid so later sorting/aggregation ignores it
-            gs[i].val = 0.0f;
-            gs[i].idx = -1;
-            gs[i].col[0] = gs[i].col[1] = gs[i].col[2] = 0.0f;
-            gs[i].mu_x = gs[i].mu_y = gs[i].theta = gs[i].inv_sx = gs[i].inv_sy = 0.0f;
-            continue;
+            // invalid entry -> zero-out & mark
+            s_mu[i*2 + 0] = 0.0f;
+            s_mu[i*2 + 1] = 0.0f;
+            s_theta[i] = 0.0f;
+            s_inv[i*2 + 0] = 0.0f;
+            s_inv[i*2 + 1] = 0.0f;
+            s_col[i*3 + 0] = 0.0f;
+            s_col[i*3 + 1] = 0.0f;
+            s_col[i*3 + 2] = 0.0f;
+            s_idx[i] = -1;
+        } else {
+            float mu_x = gaussian_means[g*2 + 0];
+            float mu_y = gaussian_means[g*2 + 1];
+            float theta = gaussian_rotations[g];
+            float log_sx = gaussian_log_scales[g*2 + 0];
+            float log_sy = gaussian_log_scales[g*2 + 1];
+            float sx = expf(log_sx);
+            float sy = expf(log_sy);
+            float inv_sx = 1.0f / sx;
+            float inv_sy = 1.0f / sy;
+
+            s_mu[i*2 + 0] = mu_x;
+            s_mu[i*2 + 1] = mu_y;
+            s_theta[i]    = theta;
+            s_inv[i*2 + 0] = inv_sx;
+            s_inv[i*2 + 1] = inv_sy;
+            s_col[i*3 + 0] = gaussian_colors[g*3 + 0];
+            s_col[i*3 + 1] = gaussian_colors[g*3 + 1];
+            s_col[i*3 + 2] = gaussian_colors[g*3 + 2];
+            s_idx[i] = g;
         }
+    }
+    __syncthreads(); // now shared arrays ready for this tile/block
 
-        float mu_x=gaussian_means[g*2+0];
-        float mu_y=gaussian_means[g*2+1];
-        float theta=gaussian_rotations[g];
-        
-        float log_sx = gaussian_log_scales[g * 2 + 0];
-        float log_sy = gaussian_log_scales[g * 2 + 1];
-        float sx = expf(log_sx);
-        float sy = expf(log_sy);
-        float inv_sx = 1.0f / sx;
-        float inv_sy = 1.0f / sy;
+    // Per-thread per-pixel values (only these are per-thread)
+    float g_values[MAX_G_PER_TILE];
 
-        float val=gaussian_eval(x,y,mu_x,mu_y,theta,inv_sx,inv_sy);
-
-        // Store parameters
-        gs[i].val=val; 
-        gs[i].idx=g;
-
-        gs[i].col[0]=gaussian_colors[g*3+0];
-        gs[i].col[1]=gaussian_colors[g*3+1];
-        gs[i].col[2]=gaussian_colors[g*3+2];
-
-        gs[i].mu_x=mu_x; 
-        gs[i].mu_y=mu_y; 
-
-        gs[i].theta=theta; 
-
-        gs[i].inv_sx=inv_sx; 
-        gs[i].inv_sy=inv_sy;
+    // Evaluate all gaussians for this pixel using shared parameters
+    for (int i = 0; i < count; ++i) {
+        float mu_x = s_mu[i*2 + 0];
+        float mu_y = s_mu[i*2 + 1];
+        float theta = s_theta[i];
+        float inv_sx = s_inv[i*2 + 0];
+        float inv_sy = s_inv[i*2 + 1];
+        g_values[i] = gaussian_eval((float)x, (float)y, mu_x, mu_y, theta, inv_sx, inv_sy);
     }
 
-    // Sort descending by val (naive)
-    //for(int i=0;i<count;i++)for(int j=i+1;j<count;j++)if(gs[i].val<gs[j].val){auto t=gs[i];gs[i]=gs[j];gs[j]=t;}
-    // Option A: naive O(n^2)
-    // naive_sort(g_values, g_colors, count);
-
-    // Option B: heap-based Top-K
-    //heap_topk(g_values, g_colors, count, K);
-
-    // Option C: Bitonic TopK
-    // bitonic_topk(g_values, g_colors, count, K);
-
-    // Option D: QuickSelect
-    //quickselect_topk(g_values, g_colors, count, K);
-
-
-
-    // Aggregate colors and compute gradients
-
+    // read top-K local indices computed by forward (indices into tile list)
     int useK = min(K,count);
     const int* topK_indices = &pixel_topk_indices[(y*W + x)*K];
-    // int useK = min(K, tile_gaussian_counts[tile_idx]); // count might be < K
 
+    // aggregate for pixel color reconstruction (match forward)
     float sum_weights = 0.0f;
     float sum_colors[3] = {0.0f,0.0f,0.0f};
 
@@ -453,57 +455,60 @@ __global__ void renderTileBackward(
             continue;
         }
 
-        sum_weights += gs[g_local ].val;
-        sum_colors[0] += gs[g_local ].val * gs[g_local ].col[0];
-        sum_colors[1] += gs[g_local ].val * gs[g_local ].col[1];
-        sum_colors[2] += gs[g_local ].val * gs[g_local ].col[2];
+        float w = g_values[g_local];
+        sum_weights += w;
+        sum_colors[0] += w * s_col[g_local*3 + 0];
+        sum_colors[1] += w * s_col[g_local*3 + 1];
+        sum_colors[2] += w * s_col[g_local*3 + 2];
     }
     if (sum_weights < 1e-8f) return;
 
-
     // Reconstructed pixel color (matching forward)
     float I_c[3] = { sum_colors[0]/sum_weights, sum_colors[1]/sum_weights, sum_colors[2]/sum_weights };
-
     float go[3] = {grad_output[(y * W + x)*3 + 0], grad_output[(y * W + x)*3 + 1], grad_output[(y * W + x)*3 + 2]};
 
-    // Aggregate colors
+    // compute grads (use shared params + per-thread g_values)
     for(int i=0;i<useK;i++){
         int g_local = topK_indices[i];
         if (g_local < 0 || g_local >= count) continue;
 
-        int g = gs[g_local].idx;            // global Gaussian ID for writing gradients
+        //int g = gs[g_local].idx;            // global Gaussian ID for writing gradients
+        int g = s_idx[g_local];           // global gaussian id
         if (g < 0 || g >= N_g) continue;
 
-        // Correct color gradient: dL/dc_k = (G_k / S) * go[c]
-        float weight = gs[g_local].val / sum_weights;
+        float Gk = g_values[g_local];
+
+        // Color gradient: dL/dc_k = (G_k / S) * go[c]
+        float weight = g_values[g_local] / sum_weights;
         for(int c=0; c<3; c++){
             float add = weight * go[c];
             atomicAdd(&grad_colors[g*3 + c], add);
         }
 
-        // Correct gradient wrt G_k:
+        // Gradient wrt G_k:
         // dL/dG_k = sum_c go[c] * (c_k[c] - I_c[c]) / S
         float dL_dGk = 0.0f;
         for (int c=0; c<3; c++){
-            dL_dGk += go[c] * (gs[g_local].col[c] - I_c[c]);
+            dL_dGk += go[c] * (s_col[g_local*3 + c] - I_c[c]);
         }
         dL_dGk /= sum_weights;
 
-        // Propagate grad_output through Gaussian eval
+        // propagate through gaussian eval:
+        // read shared params for this local index
+        float mu_x = s_mu[g_local*2 + 0];
+        float mu_y = s_mu[g_local*2 + 1];
+        float theta = s_theta[g_local];
+        float inv_sx = s_inv[g_local*2 + 0];
+        float inv_sy = s_inv[g_local*2 + 1];
+
+        // call gaussian_gradients with g_val = Gk (so returned derivatives already multiply by Gk)
         float dmu_x, dmu_y, dtheta, dinv_sx, dinv_sy;
-        gaussian_gradients((float)x, (float)y, gs[g_local].mu_x, gs[g_local].mu_y, gs[g_local].theta, gs[g_local].inv_sx, gs[g_local].inv_sy, 1.0f,
+        gaussian_gradients((float)x, (float)y, mu_x, mu_y, theta, inv_sx, inv_sy, Gk,
                            dmu_x, dmu_y, dtheta, dinv_sx, dinv_sy);
-
-        // Multiply gradients by g_val
-        dmu_x *= gs[g_local].val;
-        dmu_y *= gs[g_local].val;
-        dtheta *= gs[g_local].val;
-        dinv_sx *= gs[g_local].val;
-        dinv_sy *= gs[g_local].val;
-
+    
         // Apply chain rule for log-scales
-        float dlog_sx = -gs[g_local].inv_sx * dinv_sx;
-        float dlog_sy = -gs[g_local].inv_sy * dinv_sy;
+        float dlog_sx = -inv_sx * dinv_sx; // inv_sx == s_inv[g_local*2+0]
+        float dlog_sy = -inv_sy * dinv_sy;
 
         // Apply gradient
         atomicAdd(&grad_means[g*2+0], dmu_x * dL_dGk);
@@ -540,8 +545,7 @@ void find_tile_gaussian_correspondence_wrapper(
     int* tile_gaussian_indices_ptr = tile_gaussian_indices.data_ptr<int>();
     int* tile_gaussian_counts_ptr = tile_gaussian_counts.data_ptr<int>();
 
-    //dim3 block(16, 16);
-    //dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+    
     // Compute tile counts
     int n_tiles_x = (W + W_t - 1) / W_t;
     int n_tiles_y = (H + H_t - 1) / H_t;
@@ -600,9 +604,11 @@ void render_tile_wrapper(
     dim3 block(16, 16);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
     
-    //size_t shared_mem_size = max_G_per_tile * (1 + 3) * sizeof(float); // g_values + g_colors
+    // compute shared memory bytes required by renderTile
+    size_t shared_floats = (size_t)8 * (size_t)max_G_per_tile; // 8 floats per gaussian (2 mu + 1 theta + 2 inv + 3 color)
+    size_t shared_bytes = shared_floats * sizeof(float);
 
-    renderTile<<<grid, block>>>(
+    renderTile<<<grid, block, shared_bytes>>>(
         gaussian_means_ptr,
         gaussian_rotations_ptr,
         gaussian_log_scales_ptr,
@@ -661,7 +667,13 @@ void render_tile_backward_wrapper(
     dim3 block(16, 16);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
 
-    renderTileBackward<<<grid, block>>>(
+    // compute shared memory
+    size_t float_count = (size_t)8 * (size_t)max_G_per_tile; // 8 floats per gaussian (2 mu + 1 theta + 2 inv + 3 color)
+    size_t floats_bytes = float_count * sizeof(float);
+    size_t ints_bytes = (size_t)max_G_per_tile * sizeof(int);
+    size_t shared_bytes = floats_bytes + ints_bytes;
+
+    renderTileBackward<<<grid, block, shared_bytes>>>(
         grad_output_ptr,
         gaussian_means_ptr,
         gaussian_rotations_ptr,
