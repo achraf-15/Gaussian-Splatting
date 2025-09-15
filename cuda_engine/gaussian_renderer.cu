@@ -9,7 +9,7 @@
 
 
 
-#define MAX_G_PER_TILE 512  // compile-time upper bound, must be >= max_G_per_tile used from Python
+#define MAX_G_PER_TILE 128  // compile-time upper bound, must be >= max_G_per_tile used from Python
 #define MAX_K 100
 
 
@@ -117,7 +117,30 @@ __device__ inline void gaussian_gradients(
     dtheta = dM00*dm00_dtheta + 2*dM01*dm01_dtheta + dM11*dm11_dtheta;
 }
 
+__device__ inline void topk_selector(
+    float* values,
+    float* colors,
+    int* topK_indices,
+    int count,
+    int K,
+    int method  // 0=naive, 1=heap, 2=bitonic, 3=quickselect
+) {
+    // initialize local indices
+    int indices[MAX_G_PER_TILE];
+    for (int i = 0; i < count; i++) indices[i] = i;
 
+    switch(method) {
+        case 0: naive_sort(values, colors, indices, count); break;
+        case 1: heap_topk(values, colors, indices, count, K); break;
+        case 2: bitonic_topk(values, colors, indices, count, K); break;
+        case 3: quickselect_topk(values, colors, indices, count, K); break;
+        default: naive_sort(values, colors, indices, count); break;
+    }
+
+    int useK = min(K, count);
+    for (int i = 0; i < useK; i++)
+        topK_indices[i] = indices[i]; // return correct local indices
+}
 
 // CUDA kernel for tile-Gaussian correspondence
 __global__ void findTileGaussianCorrespondence(
@@ -172,6 +195,8 @@ __global__ void findTileGaussianCorrespondence(
         }
     }
     tile_gaussian_counts[tile_idx] = count;
+    tile_gaussian_counts[tile_idx] = min(count, max_G_per_tile);
+
 }
 
 
@@ -183,6 +208,7 @@ __global__ void renderTile(
     const float* gaussian_colors,   // [N_g, 3]
     const int* tile_gaussian_indices,// [N_t, max_G_per_tile]
     const int* tile_gaussian_counts, // [N_t]
+    int* pixel_topk_indices,
     int N_g,                         // Number of Gaussians
     int K,                           // Top-K
     int H_t,                         // Tile height
@@ -203,6 +229,9 @@ __global__ void renderTile(
     int tile_idx = tile_y * n_tiles_x + tile_x;
 
     int count = tile_gaussian_counts[tile_idx];
+    count = min(count, MAX_G_PER_TILE);
+    if (count == 0) return;
+
     const int* g_indices = &tile_gaussian_indices[tile_idx * max_G_per_tile];
 
     // local buffers (assuming count ≤ max_G_per_tile)
@@ -258,16 +287,32 @@ __global__ void renderTile(
     //heap_topk(g_values, g_colors, count, K);
 
     // Option C: Bitonic TopK
-    bitonic_topk(g_values, g_colors, count, K);
+    // bitonic_topk(g_values, g_colors, count, K);
 
     // Option D: QuickSelect
     //quickselect_topk(g_values, g_colors, count, K);
 
-    int topK_indices[MAX_K];
+    int topK_indices[MAX_G_PER_TILE]; // temporary local storage
+    topk_selector(g_values, g_colors, topK_indices, count, K, 2); // 0=naive, 1=heap, 2=bitonic, 3=quickselect
+
+    // Write top-K **local indices** to global memory
+    int useK = min(K, count);
+    int* pixel_topk_ptr = &pixel_topk_indices[(y*W + x)*K];
+    for (int i = 0; i < useK; i++) {
+        int local_idx = topK_indices[i];   // index into gs array
+        if (local_idx < 0 || local_idx >= count) {
+            printf("renderTile: BAD_LOCAL_INDEX local_idx=%d at tile_idx=%d pixel=(%d,%d) count=%d\\n",
+                local_idx, tile_idx, x, y, count);
+            pixel_topk_ptr[i] = -1; // mark invalid
+            continue;
+        }
+        pixel_topk_ptr[i] = local_idx; // store local index, NOT global
+    }
+
 
         
     // Aggregate colors
-    int useK = min(K,count);
+    //int useK = min(K,count);
     float sum_weights = 0.0f;
     float sum_colors[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < useK; i++) {
@@ -302,6 +347,7 @@ __global__ void renderTileBackward(
     float* grad_rotations,           // Gradient of rotations [N_g]
     float* grad_log_scales,          // Gradient of inverse scales [N_g, 2]
     float* grad_colors,              // Gradient of colors [N_g, 3]
+    const int* pixel_topk_indices,
     int N_g,                         // Number of Gaussians
     int K,                           // Top-K
     int H_t,                         // Tile height
@@ -321,9 +367,8 @@ __global__ void renderTileBackward(
     int tile_idx = tile_y * n_tiles_x + tile_x;
 
     int count = tile_gaussian_counts[tile_idx];
-
+    count = min(count, MAX_G_PER_TILE);
     if (count == 0) return;
-    if (count > MAX_G_PER_TILE) return; // safety guard; ensure Python-side max_G_per_tile <= MAX_G_PER_TILE
 
     const int* g_indices = &tile_gaussian_indices[tile_idx * max_G_per_tile];
 
@@ -335,7 +380,7 @@ __global__ void renderTileBackward(
         int g=g_indices[i];
         
         if (g < 0 || g >= N_g) {
-            printf("renderTileBackward: BAD_G_INDEX g=%d tile_idx=%d pixel=(%d,%d) count=%d N_g=%d\\n",
+            printf("renderTileBackward 1: BAD_G_INDEX g=%d tile_idx=%d pixel=(%d,%d) count=%d N_g=%d\\n",
                    g, tile_idx, x, y, count, N_g);
             // mark invalid so later sorting/aggregation ignores it
             gs[i].val = 0.0f;
@@ -376,7 +421,7 @@ __global__ void renderTileBackward(
     }
 
     // Sort descending by val (naive)
-    for(int i=0;i<count;i++)for(int j=i+1;j<count;j++)if(gs[i].val<gs[j].val){auto t=gs[i];gs[i]=gs[j];gs[j]=t;}
+    //for(int i=0;i<count;i++)for(int j=i+1;j<count;j++)if(gs[i].val<gs[j].val){auto t=gs[i];gs[i]=gs[j];gs[j]=t;}
     // Option A: naive O(n^2)
     // naive_sort(g_values, g_colors, count);
 
@@ -389,15 +434,29 @@ __global__ void renderTileBackward(
     // Option D: QuickSelect
     //quickselect_topk(g_values, g_colors, count, K);
 
+
+
     // Aggregate colors and compute gradients
+
     int useK = min(K,count);
+    const int* topK_indices = &pixel_topk_indices[(y*W + x)*K];
+    // int useK = min(K, tile_gaussian_counts[tile_idx]); // count might be < K
+
     float sum_weights = 0.0f;
     float sum_colors[3] = {0.0f,0.0f,0.0f};
+
     for (int i = 0; i < useK; i++) {
-        sum_weights += gs[i].val;
-        sum_colors[0] += gs[i].val * gs[i].col[0];
-        sum_colors[1] += gs[i].val * gs[i].col[1];
-        sum_colors[2] += gs[i].val * gs[i].col[2];
+        int g_local  = topK_indices[i];
+        if (g_local  < 0 || g_local  >= N_g) {
+            printf("renderTileBackward 2: BAD_G_INDEX g=%d at tile_idx=%d pixel=(%d,%d) count=%d N_g=%d n_tiles_x=%d\\n",
+                   g_local , tile_idx, x, y, count, N_g, n_tiles_x);
+            continue;
+        }
+
+        sum_weights += gs[g_local ].val;
+        sum_colors[0] += gs[g_local ].val * gs[g_local ].col[0];
+        sum_colors[1] += gs[g_local ].val * gs[g_local ].col[1];
+        sum_colors[2] += gs[g_local ].val * gs[g_local ].col[2];
     }
     if (sum_weights < 1e-8f) return;
 
@@ -409,11 +468,14 @@ __global__ void renderTileBackward(
 
     // Aggregate colors
     for(int i=0;i<useK;i++){
-        int g = gs[i].idx;
-        if (g < 0) continue;
+        int g_local = topK_indices[i];
+        if (g_local < 0 || g_local >= count) continue;
+
+        int g = gs[g_local].idx;            // global Gaussian ID for writing gradients
+        if (g < 0 || g >= N_g) continue;
 
         // Correct color gradient: dL/dc_k = (G_k / S) * go[c]
-        float weight = gs[i].val / sum_weights;
+        float weight = gs[g_local].val / sum_weights;
         for(int c=0; c<3; c++){
             float add = weight * go[c];
             atomicAdd(&grad_colors[g*3 + c], add);
@@ -423,25 +485,25 @@ __global__ void renderTileBackward(
         // dL/dG_k = sum_c go[c] * (c_k[c] - I_c[c]) / S
         float dL_dGk = 0.0f;
         for (int c=0; c<3; c++){
-            dL_dGk += go[c] * (gs[i].col[c] - I_c[c]);
+            dL_dGk += go[c] * (gs[g_local].col[c] - I_c[c]);
         }
         dL_dGk /= sum_weights;
 
         // Propagate grad_output through Gaussian eval
         float dmu_x, dmu_y, dtheta, dinv_sx, dinv_sy;
-        gaussian_gradients((float)x, (float)y, gs[i].mu_x, gs[i].mu_y, gs[i].theta, gs[i].inv_sx, gs[i].inv_sy, 1.0f,
+        gaussian_gradients((float)x, (float)y, gs[g_local].mu_x, gs[g_local].mu_y, gs[g_local].theta, gs[g_local].inv_sx, gs[g_local].inv_sy, 1.0f,
                            dmu_x, dmu_y, dtheta, dinv_sx, dinv_sy);
 
         // Multiply gradients by g_val
-        dmu_x *= gs[i].val;
-        dmu_y *= gs[i].val;
-        dtheta *= gs[i].val;
-        dinv_sx *= gs[i].val;
-        dinv_sy *= gs[i].val;
+        dmu_x *= gs[g_local].val;
+        dmu_y *= gs[g_local].val;
+        dtheta *= gs[g_local].val;
+        dinv_sx *= gs[g_local].val;
+        dinv_sy *= gs[g_local].val;
 
         // Apply chain rule for log-scales
-        float dlog_sx = -gs[i].inv_sx * dinv_sx;
-        float dlog_sy = -gs[i].inv_sy * dinv_sy;
+        float dlog_sx = -gs[g_local].inv_sx * dinv_sx;
+        float dlog_sy = -gs[g_local].inv_sy * dinv_sy;
 
         // Apply gradient
         atomicAdd(&grad_means[g*2+0], dmu_x * dL_dGk);
@@ -517,6 +579,7 @@ void render_tile_wrapper(
     torch::Tensor tile_gaussian_indices,
     torch::Tensor tile_gaussian_counts,
     torch::Tensor output_image,
+    torch::Tensor pixel_topk_indices,
     int N_g,                        
     int K,
     int H_t,
@@ -532,6 +595,7 @@ void render_tile_wrapper(
     const int* tile_gaussian_indices_ptr = tile_gaussian_indices.data_ptr<int>();
     const int* tile_gaussian_counts_ptr = tile_gaussian_counts.data_ptr<int>();
     float* output_image_ptr = output_image.data_ptr<float>();
+    int* pixel_topk_indices_ptr = pixel_topk_indices.data_ptr<int>();
 
     dim3 block(16, 16);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
@@ -545,6 +609,7 @@ void render_tile_wrapper(
         gaussian_colors_ptr,
         tile_gaussian_indices_ptr,
         tile_gaussian_counts_ptr,
+        pixel_topk_indices_ptr,
         N_g,
         K,
         H_t,
@@ -571,6 +636,7 @@ void render_tile_backward_wrapper(
     torch::Tensor grad_rotations,
     torch::Tensor grad_log_scales,
     torch::Tensor grad_colors,
+    torch::Tensor pixel_topk_indices,
     int N_g,
     int K,
     int H_t,
@@ -590,6 +656,7 @@ void render_tile_backward_wrapper(
     float* grad_rotations_ptr = grad_rotations.data_ptr<float>();
     float* grad_log_scales_ptr = grad_log_scales.data_ptr<float>();
     float* grad_colors_ptr = grad_colors.data_ptr<float>();
+    const int* pixel_topk_indices_ptr = pixel_topk_indices.data_ptr<int>();
 
     dim3 block(16, 16);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
@@ -606,6 +673,7 @@ void render_tile_backward_wrapper(
         grad_rotations_ptr,
         grad_log_scales_ptr,
         grad_colors_ptr,
+        pixel_topk_indices_ptr,
         N_g,
         K,
         H_t,
