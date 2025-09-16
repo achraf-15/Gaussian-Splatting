@@ -91,24 +91,25 @@ class ImageGSOptimizer:
 
         means = torch.stack([xs.float(), ys.float()], dim=1).to(self.device)
         rotations = torch.zeros(N_init, device=self.device)
-        log_scales = torch.full((N_init,2), math.log(self.init_scale_pixels), device=self.device)
+        # log_scales = torch.full((N_init,2), math.log(self.init_scale_pixels), device=self.device)
+        inv_scales = torch.full((N_init,2), 1.0/self.init_scale_pixels, device=self.device)
         colors = self.target_image[ys, xs, :].to(self.device).float()
 
         means.requires_grad_(True)
         rotations.requires_grad_(True)
-        log_scales.requires_grad_(True)
+        inv_scales.requires_grad_(True)
         colors.requires_grad_(True)
 
-        return means, rotations, log_scales, colors
+        return means, rotations, inv_scales, colors
 
     # ------------------------------
     # Optimizer Setup
     # ------------------------------
-    def make_optimizer(self, means, rotations, log_scales, colors):
+    def make_optimizer(self, means, rotations, inv_scales, colors):
         return optim.Adam([
             {"params":[means], "lr":5e-4},
             {"params":[colors], "lr":5e-3},
-            {"params":[log_scales], "lr":2e-3},
+            {"params":[inv_scales], "lr":2e-3},
             {"params":[rotations], "lr":2e-3},
         ])
 
@@ -117,18 +118,18 @@ class ImageGSOptimizer:
     # ------------------------------
     def optimize(self, visualize_interval=500, plot_last=True):
         # Initialization
-        means, rotations, log_scales, colors = self.initialize_gaussians()
-        optimizer = self.make_optimizer(means, rotations, log_scales, colors)
+        means, rotations, inv_scales, colors = self.initialize_gaussians()
+        optimizer = self.make_optimizer(means, rotations, inv_scales, colors)
         N_current = means.shape[0]
         add_steps = set(range(self.add_interval, self.steps+1, self.add_interval))
         saved_debug = {}
 
-        self.visualize('Initialization', means, log_scales, rotations, colors, rendered=None)
+        self.visualize('Initialization', means, inv_scales, rotations, colors, rendered=None)
 
 
         for step in tqdm(range(1, self.steps+1), desc="Rendering Image"):
             optimizer.zero_grad()
-            rendered = self.renderer(means, rotations, log_scales, colors)
+            rendered = self.renderer(means, rotations, inv_scales, colors)
             loss_l1 = self.l1(rendered, self.target_image)
             loss_mssim = 1.0 - self.ms_ssim_fn(rendered.permute(2,0,1).unsqueeze(0),
                                               self.target_image.permute(2,0,1).unsqueeze(0))
@@ -139,7 +140,7 @@ class ImageGSOptimizer:
             # Clamp physically valid ranges
             with torch.no_grad():
                 # inv_scales should be positive (paper uses 1/s). Clamp to avoid sign flips.
-                #inv_scales.clamp_(min=1e-4, max=1.0)  # min corresponds to large s, max to s=1
+                inv_scales.clamp_(min=1e-4, max=1.0)  # min corresponds to large s, max to s=1
                 # rotations in [0, pi]
                 rotations[:] = torch.remainder(rotations, math.pi)
                  # colors in [0,1]
@@ -156,27 +157,28 @@ class ImageGSOptimizer:
 
                     new_means = torch.stack([xs_add.float(), ys_add.float()], dim=1).to(self.device)
                     new_rot = torch.zeros(n_add, device=self.device)
-                    new_log_sc = torch.full((n_add,2), math.log(self.init_scale_pixels), device=self.device)
+                    # new_log_sc = torch.full((n_add,2), math.log(self.init_scale_pixels), device=self.device)
+                    new_log_sc = torch.full((n_add,2), 1.0/self.init_scale_pixels, device=self.device)
                     new_colors = self.target_image[ys_add, xs_add, :].to(self.device).float()
 
                     # Concatenate to params
                     means = torch.cat([means.detach(), new_means], dim=0).requires_grad_(True)
                     rotations = torch.cat([rotations.detach(), new_rot], dim=0).requires_grad_(True)
-                    log_scales = torch.cat([log_scales.detach(), new_log_sc], dim=0).requires_grad_(True)
+                    inv_scales = torch.cat([inv_scales.detach(), new_log_sc], dim=0).requires_grad_(True)
                     colors = torch.cat([colors.detach(), new_colors], dim=0).requires_grad_(True)
                     N_current = means.shape[0]
-                    optimizer = self.make_optimizer(means, rotations, log_scales, colors)
+                    optimizer = self.make_optimizer(means, rotations, inv_scales, colors)
 
             # Save debug info
             if step % visualize_interval == 0 or step == 1 or step == self.steps:
                 saved_debug[step] = {"loss": loss.item(), "N": N_current, "rendered": rendered.detach().cpu()}
-                self.visualize(step, means, log_scales, rotations, colors, rendered, plot=False)
+                self.visualize(step, means, inv_scales, rotations, colors, rendered, plot=False)
 
-        self.visualize('Final', means, log_scales, rotations, colors, rendered, plot=True)
+        self.visualize('Final', means, inv_scales, rotations, colors, rendered, plot=True)
 
-        return means, rotations, log_scales, colors, saved_debug
+        return means, rotations, inv_scales, colors, saved_debug
     
-    def visualize(self, step, means, log_scales, rotations, colors, rendered=None, plot=False):
+    def visualize(self, step, means, inv_scales, rotations, colors, rendered=None, plot=False):
         # Set figsize and DPI so that HxW pixels exactly
         dpi = 100
         if rendered is not None: 
@@ -191,7 +193,8 @@ class ImageGSOptimizer:
         axes[0].axis('off')
         
         axes[1].set_facecolor('black')
-        scales = torch.exp(log_scales).detach().cpu().numpy()
+        #scales = torch.exp(inv_scales).detach().cpu().numpy()
+        scales = 1.0 / inv_scales.detach().cpu().numpy()
         means_np = means.detach().cpu().numpy()
         rotations_np = rotations.detach().cpu().numpy()
         colors_np = colors.detach().cpu().numpy()
@@ -238,4 +241,4 @@ if __name__ == "__main__":
 
     optimizer = ImageGSOptimizer(target_image, save_dir="gs_output", device=device,
                                  N_total=10000, steps=1500, H_t=16, W_t=16, add_interval=250)
-    means, rotations, log_scales, colors, debug = optimizer.optimize()
+    means, rotations, inv_scales, colors, debug = optimizer.optimize()

@@ -6,145 +6,16 @@
 #include <stdio.h>
 
 #include "sorting.cuh"
+#include "utils.cuh"
 
 #define MAX_G_PER_TILE 128  // compile-time upper bound, must be >= max_G_per_tile used from Python
-#define MAX_K 100
 
-
-// ============================================================
-// Utility: Gaussian evaluation
-// ============================================================
-
-__device__ inline float gaussian_eval(
-    float x, float y,
-    float mu_x, float mu_y,
-    float theta, float inv_sx, float inv_sy
-) {
-    float cos_t = cosf(theta);
-    float sin_t = sinf(theta);
-
-    float inv_var_x = inv_sx * inv_sx;
-    float inv_var_y = inv_sy * inv_sy;
-
-    // R = [[cos, -sin], [sin, cos]]
-    float R00 = cos_t, R01 = -sin_t;
-    float R10 = sin_t, R11 = cos_t;
-
-    // Σ⁻¹ = R diag(inv_var_x, inv_var_y) R^T
-    float m00 = R00 * inv_var_x * R00 + R01 * inv_var_y * R01;
-    float m01 = R00 * inv_var_x * R10 + R01 * inv_var_y * R11;
-    float m11 = R10 * inv_var_x * R10 + R11 * inv_var_y * R11;
-
-    float dx = x - mu_x;
-    float dy = y - mu_y;
-
-    float qf = m00 * dx * dx + 2.f * m01 * dx * dy + m11 * dy * dy;
-
-    // Clamp exponent for numerical stability
-    float exponent = -0.5f * fminf(qf, 1e4f);
-    return expf(exponent);
-}
-
-// ============================================================
-// Utility: Gaussian gradients
-// ============================================================
-
-__device__ inline void gaussian_gradients(
-    float x, float y,
-    float mu_x, float mu_y,
-    float theta, float inv_sx, float inv_sy,
-    float g_val,
-    float &dmu_x, float &dmu_y,
-    float &dtheta, float &dinv_sx, float &dinv_sy
-) {
-    float cos_t = cosf(theta);
-    float sin_t = sinf(theta);
-
-    float inv_var_x = inv_sx * inv_sx;
-    float inv_var_y = inv_sy * inv_sy;
-
-    float R00 = cos_t, R01 = -sin_t;
-    float R10 = sin_t, R11 = cos_t;
-
-    // Σ⁻¹
-    float m00 = R00 * inv_var_x * R00 + R01 * inv_var_y * R01;
-    float m01 = R00 * inv_var_x * R10 + R01 * inv_var_y * R11;
-    float m11 = R10 * inv_var_x * R10 + R11 * inv_var_y * R11;
-
-    float dx = x - mu_x;
-    float dy = y - mu_y;
-
-    // ∂g/∂μ = -g * M (p-μ)
-    float tmp_x = m00 * dx + m01 * dy;
-    float tmp_y = m01 * dx + m11 * dy;
-    dmu_x = -g_val * tmp_x;
-    dmu_y = -g_val * tmp_y;
-
-    // ∂g/∂M = -0.5 g (p-μ)(p-μ)^T
-    float outer00 = dx * dx;
-    float outer01 = dx * dy;
-    float outer11 = dy * dy;
-
-    float dM00 = -0.5f * g_val * outer00;
-    float dM01 = -0.5f * g_val * outer01;
-    float dM11 = -0.5f * g_val * outer11;
-
-    // Chain rule
-    // ∂M/∂inv_var_x = R[:,0]R[:,0]^T
-    float dM00_invx = R00 * R00;
-    float dM01_invx = R00 * R10;
-    float dM11_invx = R10 * R10;
-
-    // ∂M/∂inv_var_y = R[:,1]R[:,1]^T
-    float dM00_invy = R01 * R01;
-    float dM01_invy = R01 * R11;
-    float dM11_invy = R11 * R11;
-
-    dinv_sx = (dM00*dM00_invx + 2*dM01*dM01_invx + dM11*dM11_invx) * (2*inv_sx);
-    dinv_sy = (dM00*dM00_invy + 2*dM01*dM01_invy + dM11*dM11_invy) * (2*inv_sy);
-
-    // ∂M/∂θ
-    float dR00 = -sin_t, dR01 = -cos_t;
-    float dR10 = cos_t, dR11 = -sin_t;
-
-    float dm00_dtheta = 2*(dR00*inv_var_x*R00 + dR01*inv_var_y*R01);
-    float dm01_dtheta = dR00*inv_var_x*R10 + R00*inv_var_x*dR10 +
-                        dR01*inv_var_y*R11 + R01*inv_var_y*dR11;
-    float dm11_dtheta = 2*(dR10*inv_var_x*R10 + dR11*inv_var_y*R11);
-
-    dtheta = dM00*dm00_dtheta + 2*dM01*dm01_dtheta + dM11*dm11_dtheta;
-}
-
-__device__ inline void topk_selector(
-    float* values,
-    float* colors,
-    int* topK_indices,
-    int count,
-    int K,
-    int method  // 0=naive, 1=heap, 2=bitonic, 3=quickselect
-) {
-    // initialize local indices
-    int indices[MAX_G_PER_TILE];
-    for (int i = 0; i < count; i++) indices[i] = i;
-
-    switch(method) {
-        case 0: naive_sort(values, colors, indices, count); break;
-        case 1: heap_topk(values, colors, indices, count, K); break;
-        case 2: bitonic_topk(values, colors, indices, count, K); break;
-        case 3: quickselect_topk(values, colors, indices, count, K); break;
-        default: naive_sort(values, colors, indices, count); break;
-    }
-
-    int useK = min(K, count);
-    for (int i = 0; i < useK; i++)
-        topK_indices[i] = indices[i]; // return correct local indices
-}
 
 // CUDA kernel for tile-Gaussian correspondence
 __global__ void findTileGaussianCorrespondence(
     const float* gaussian_means,    // [N_g, 2]
     const float* gaussian_rotations, // [N_g] (radians)
-    const float* gaussian_log_scales, // [N_g, 2] (logs of scales)
+    const float* gaussian_inv_scales, // [N_g, 2] (inv of scales)
     int N_g,                         // Number of Gaussians
     int H_t,                          // Tile height
     int W_t,                          // Tile width
@@ -175,10 +46,10 @@ __global__ void findTileGaussianCorrespondence(
         float g_x = gaussian_means[g * 2 + 0];
         float g_y = gaussian_means[g * 2 + 1];
 
-        float log_sx = gaussian_log_scales[g * 2 + 0];
-        float log_sy = gaussian_log_scales[g * 2 + 1];
-        float sx = expf(log_sx);
-        float sy = expf(log_sy);
+        float log_sx = gaussian_inv_scales[g * 2 + 0];
+        float log_sy = gaussian_inv_scales[g * 2 + 1];
+        float sx =1.0f / log_sx;
+        float sy =1.0f / log_sy;
 
         float radius = 3.f * fmaxf(sx, sy);
 
@@ -202,7 +73,7 @@ __global__ void findTileGaussianCorrespondence(
 __global__ void renderTile(
     const float* gaussian_means,    // [N_g, 2]
     const float* gaussian_rotations, // [N_g] (radians)
-    const float* gaussian_log_scales, // [N_g, 2] (logs of scales)
+    const float* gaussian_inv_scales, // [N_g, 2] (inv of scales)
     const float* gaussian_colors,   // [N_g, 3]
     const int* tile_gaussian_indices,// [N_t, max_G_per_tile]
     const int* tile_gaussian_counts, // [N_t]
@@ -260,12 +131,8 @@ __global__ void renderTile(
             float mu_x = gaussian_means[g*2 + 0];
             float mu_y = gaussian_means[g*2 + 1];
             float theta = gaussian_rotations[g];
-            float log_sx = gaussian_log_scales[g*2 + 0];
-            float log_sy = gaussian_log_scales[g*2 + 1];
-            float sx = expf(log_sx);
-            float sy = expf(log_sy);
-            float inv_sx = 1.0f / sx;
-            float inv_sy = 1.0f / sy;
+            float inv_sx = gaussian_inv_scales[g*2 + 0];
+            float inv_sy = gaussian_inv_scales[g*2 + 1];
 
             s_mu[i*2 + 0] = mu_x;
             s_mu[i*2 + 1] = mu_y;
@@ -345,13 +212,13 @@ __global__ void renderTileBackward(
     const float* grad_output,        // Gradient of the output image [H, W, 3]
     const float* gaussian_means,    // [N_g, 2]
     const float* gaussian_rotations, // [N_g] (radians)
-    const float* gaussian_log_scales, // [N_g, 2] (logs of scales)
+    const float* gaussian_inv_scales, // [N_g, 2] (inv of scales)
     const float* gaussian_colors,   // [N_g, 3]
     const int* tile_gaussian_indices,// [N_t, max_G_per_tile]
     const int* tile_gaussian_counts, // [N_t]
     float* grad_means,               // Gradient of means [N_g, 2]
     float* grad_rotations,           // Gradient of rotations [N_g]
-    float* grad_log_scales,          // Gradient of inverse scales [N_g, 2]
+    float* grad_inv_scales,          // Gradient of inverse scales [N_g, 2]
     float* grad_colors,              // Gradient of colors [N_g, 3]
     const int* pixel_topk_indices,
     int N_g,                         // Number of Gaussians
@@ -406,18 +273,16 @@ __global__ void renderTileBackward(
             float mu_x = gaussian_means[g*2 + 0];
             float mu_y = gaussian_means[g*2 + 1];
             float theta = gaussian_rotations[g];
-            float log_sx = gaussian_log_scales[g*2 + 0];
-            float log_sy = gaussian_log_scales[g*2 + 1];
-            float sx = expf(log_sx);
-            float sy = expf(log_sy);
-            float inv_sx = 1.0f / sx;
-            float inv_sy = 1.0f / sy;
+            float inv_sx = gaussian_inv_scales[g*2 + 0];
+            float inv_sy = gaussian_inv_scales[g*2 + 1];
 
             s_mu[i*2 + 0] = mu_x;
             s_mu[i*2 + 1] = mu_y;
             s_theta[i]    = theta;
-            s_inv[i*2 + 0] = inv_sx;
-            s_inv[i*2 + 1] = inv_sy;
+            // s_inv[i*2 + 0]= inv_sx;
+            // s_inv[i*2 + 1]= inv_sy;
+            s_inv[i*2 + 0]= inv_sx;
+            s_inv[i*2 + 1]= inv_sy;
             s_col[i*3 + 0] = gaussian_colors[g*3 + 0];
             s_col[i*3 + 1] = gaussian_colors[g*3 + 1];
             s_col[i*3 + 2] = gaussian_colors[g*3 + 2];
@@ -505,17 +370,13 @@ __global__ void renderTileBackward(
         float dmu_x, dmu_y, dtheta, dinv_sx, dinv_sy;
         gaussian_gradients((float)x, (float)y, mu_x, mu_y, theta, inv_sx, inv_sy, Gk,
                            dmu_x, dmu_y, dtheta, dinv_sx, dinv_sy);
-    
-        // Apply chain rule for log-scales
-        float dlog_sx = -inv_sx * dinv_sx; // inv_sx == s_inv[g_local*2+0]
-        float dlog_sy = -inv_sy * dinv_sy;
 
         // Apply gradient
         atomicAdd(&grad_means[g*2+0], dmu_x * dL_dGk);
         atomicAdd(&grad_means[g*2+1], dmu_y * dL_dGk);
         atomicAdd(&grad_rotations[g], dtheta * dL_dGk);
-        atomicAdd(&grad_log_scales[g*2+0], dlog_sx  * dL_dGk);
-        atomicAdd(&grad_log_scales[g*2+1], dlog_sy * dL_dGk);
+        atomicAdd(&grad_inv_scales[g*2+0], dinv_sx  * dL_dGk);
+        atomicAdd(&grad_inv_scales[g*2+1], dinv_sy * dL_dGk);
     }
 }
 
@@ -529,7 +390,7 @@ __global__ void renderTileBackward(
 void find_tile_gaussian_correspondence_wrapper(
     torch::Tensor gaussian_means,
     torch::Tensor gaussian_rotations,
-    torch::Tensor gaussian_log_scales,
+    torch::Tensor gaussian_inv_scales,
     int N_g,
     int H_t,
     int W_t,
@@ -541,7 +402,7 @@ void find_tile_gaussian_correspondence_wrapper(
 ) {
     const float* gaussian_means_ptr = gaussian_means.data_ptr<float>();
     const float* gaussian_rotations_ptr = gaussian_rotations.data_ptr<float>();
-    const float* gaussian_log_scales_ptr = gaussian_log_scales.data_ptr<float>();
+    const float* gaussian_inv_scales_ptr = gaussian_inv_scales.data_ptr<float>();
     int* tile_gaussian_indices_ptr = tile_gaussian_indices.data_ptr<int>();
     int* tile_gaussian_counts_ptr = tile_gaussian_counts.data_ptr<int>();
 
@@ -562,7 +423,7 @@ void find_tile_gaussian_correspondence_wrapper(
     findTileGaussianCorrespondence<<<grid, block>>>(
         gaussian_means_ptr,
         gaussian_rotations_ptr,
-        gaussian_log_scales_ptr,
+        gaussian_inv_scales_ptr,
         N_g,
         H_t,
         W_t,
@@ -578,7 +439,7 @@ void find_tile_gaussian_correspondence_wrapper(
 void render_tile_wrapper(
     torch::Tensor gaussian_means,
     torch::Tensor gaussian_rotations,
-    torch::Tensor gaussian_log_scales,
+    torch::Tensor gaussian_inv_scales,
     torch::Tensor gaussian_colors,
     torch::Tensor tile_gaussian_indices,
     torch::Tensor tile_gaussian_counts,
@@ -594,7 +455,7 @@ void render_tile_wrapper(
 ) {
     const float* gaussian_means_ptr = gaussian_means.data_ptr<float>();
     const float* gaussian_rotations_ptr = gaussian_rotations.data_ptr<float>();
-    const float* gaussian_log_scales_ptr = gaussian_log_scales.data_ptr<float>();
+    const float* gaussian_inv_scales_ptr = gaussian_inv_scales.data_ptr<float>();
     const float* gaussian_colors_ptr = gaussian_colors.data_ptr<float>();
     const int* tile_gaussian_indices_ptr = tile_gaussian_indices.data_ptr<int>();
     const int* tile_gaussian_counts_ptr = tile_gaussian_counts.data_ptr<int>();
@@ -611,7 +472,7 @@ void render_tile_wrapper(
     renderTile<<<grid, block, shared_bytes>>>(
         gaussian_means_ptr,
         gaussian_rotations_ptr,
-        gaussian_log_scales_ptr,
+        gaussian_inv_scales_ptr,
         gaussian_colors_ptr,
         tile_gaussian_indices_ptr,
         tile_gaussian_counts_ptr,
@@ -634,13 +495,13 @@ void render_tile_backward_wrapper(
     torch::Tensor grad_output,
     torch::Tensor gaussian_means,
     torch::Tensor gaussian_rotations,
-    torch::Tensor gaussian_log_scales,
+    torch::Tensor gaussian_inv_scales,
     torch::Tensor gaussian_colors,
     torch::Tensor tile_gaussian_indices,
     torch::Tensor tile_gaussian_counts,
     torch::Tensor grad_means,
     torch::Tensor grad_rotations,
-    torch::Tensor grad_log_scales,
+    torch::Tensor grad_inv_scales,
     torch::Tensor grad_colors,
     torch::Tensor pixel_topk_indices,
     int N_g,
@@ -654,13 +515,13 @@ void render_tile_backward_wrapper(
     const float* grad_output_ptr = grad_output.data_ptr<float>();
     const float* gaussian_means_ptr = gaussian_means.data_ptr<float>();
     const float* gaussian_rotations_ptr = gaussian_rotations.data_ptr<float>();
-    const float* gaussian_log_scales_ptr = gaussian_log_scales.data_ptr<float>();
+    const float* gaussian_inv_scales_ptr = gaussian_inv_scales.data_ptr<float>();
     const float* gaussian_colors_ptr = gaussian_colors.data_ptr<float>();
     const int* tile_gaussian_indices_ptr = tile_gaussian_indices.data_ptr<int>();
     const int* tile_gaussian_counts_ptr = tile_gaussian_counts.data_ptr<int>();
     float* grad_means_ptr = grad_means.data_ptr<float>();
     float* grad_rotations_ptr = grad_rotations.data_ptr<float>();
-    float* grad_log_scales_ptr = grad_log_scales.data_ptr<float>();
+    float* grad_inv_scales_ptr = grad_inv_scales.data_ptr<float>();
     float* grad_colors_ptr = grad_colors.data_ptr<float>();
     const int* pixel_topk_indices_ptr = pixel_topk_indices.data_ptr<int>();
 
@@ -677,13 +538,13 @@ void render_tile_backward_wrapper(
         grad_output_ptr,
         gaussian_means_ptr,
         gaussian_rotations_ptr,
-        gaussian_log_scales_ptr,
+        gaussian_inv_scales_ptr,
         gaussian_colors_ptr,
         tile_gaussian_indices_ptr,
         tile_gaussian_counts_ptr,
         grad_means_ptr,
         grad_rotations_ptr,
-        grad_log_scales_ptr,
+        grad_inv_scales_ptr,
         grad_colors_ptr,
         pixel_topk_indices_ptr,
         N_g,
