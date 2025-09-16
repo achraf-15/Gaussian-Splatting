@@ -3,6 +3,9 @@ import torch.nn as nn
 from torch.autograd import Function
 import cuda_engine.gaussian_renderer_cuda as renderer  # type: ignore
 
+#import nvtx
+
+
 class GaussianRendererFunction(Function):
     @staticmethod
     def forward(ctx, gaussian_means, gaussian_rotations, gaussian_log_scales, gaussian_colors, H, W, H_t, W_t, K, max_G_per_tile):
@@ -16,6 +19,7 @@ class GaussianRendererFunction(Function):
         pixel_topk_indices = torch.full((H*W*K,), -1, dtype=torch.int32, device=gaussian_means.device)
 
         # Call CUDA kernels
+        #with nvtx.annotate("Tile_Gaussians"):
         renderer.find_tile_gaussian_correspondence(
             gaussian_means.contiguous(),
             gaussian_rotations.contiguous(),
@@ -29,7 +33,9 @@ class GaussianRendererFunction(Function):
             tile_gaussian_counts,
             max_G_per_tile
         )
+        #torch.cuda.synchronize()
 
+        #with nvtx.annotate("Forward"):
         renderer.render_tile(
             gaussian_means.contiguous(),
             gaussian_rotations.contiguous(),
@@ -47,7 +53,8 @@ class GaussianRendererFunction(Function):
             W,
             max_G_per_tile
         )
-
+        #torch.cuda.synchronize()
+        
         # Save tensors for backward pass
         ctx.save_for_backward(gaussian_means, gaussian_rotations, gaussian_log_scales, gaussian_colors, tile_gaussian_indices, tile_gaussian_counts, pixel_topk_indices)
         ctx.H, ctx.W, ctx.H_t, ctx.W_t, ctx.K, ctx.max_G_per_tile = H, W, H_t, W_t, K, max_G_per_tile
@@ -67,6 +74,7 @@ class GaussianRendererFunction(Function):
         grad_colors = torch.zeros_like(gaussian_colors)
 
         # Call CUDA kernels for backward pass
+        #with nvtx.annotate("Backward"):
         renderer.render_tile_backward(
             grad_output.contiguous(),
             gaussian_means.contiguous(),
@@ -88,6 +96,7 @@ class GaussianRendererFunction(Function):
             W,
             max_G_per_tile
         )
+        #torch.cuda.synchronize()
 
         return grad_means, grad_rotations, grad_log_scales, grad_colors, None, None, None, None, None, None
 

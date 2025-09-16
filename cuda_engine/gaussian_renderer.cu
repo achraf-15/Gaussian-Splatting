@@ -572,7 +572,7 @@ void find_tile_gaussian_correspondence_wrapper(
         tile_gaussian_counts_ptr,
         max_G_per_tile
     );
-    cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 void render_tile_wrapper(
@@ -625,7 +625,7 @@ void render_tile_wrapper(
         output_image_ptr,
         max_G_per_tile
     );
-    cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 
@@ -694,7 +694,7 @@ void render_tile_backward_wrapper(
         W,
         max_G_per_tile
     );
-    cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 
