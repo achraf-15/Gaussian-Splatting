@@ -3,9 +3,6 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <stdio.h>
-#include "sorting.cuh"
-
-#define MAX_G_PER_TILE 128
 
 
 // Utility: Gaussian evaluation
@@ -66,11 +63,11 @@ __device__ inline void gaussian_gradients(
     float dx = x - mu_x;
     float dy = y - mu_y;
 
-    // ∂g/∂μ = -g * M (p-μ)
+    // ∂g/∂μ = g * M (p-μ)
     float tmp_x = m00 * dx + m01 * dy;
     float tmp_y = m01 * dx + m11 * dy;
-    dmu_x = -g_val * tmp_x;
-    dmu_y = -g_val * tmp_y;
+    dmu_x = g_val * tmp_x;
+    dmu_y = g_val * tmp_y;
 
     // ∂g/∂M = -0.5 g (p-μ)(p-μ)^T
     float outer00 = dx * dx;
@@ -105,29 +102,4 @@ __device__ inline void gaussian_gradients(
     float dm11_dtheta = 2*(dR10*inv_var_x*R10 + dR11*inv_var_y*R11);
 
     dtheta = dM00*dm00_dtheta + 2*dM01*dm01_dtheta + dM11*dm11_dtheta;
-}
-
-__device__ inline void topk_selector(
-    float* values,
-    float* colors,
-    int* topK_indices,
-    int count,
-    int K,
-    int method  // 0=naive, 1=heap, 2=bitonic, 3=quickselect
-) {
-    // initialize local indices
-    int indices[MAX_G_PER_TILE];
-    for (int i = 0; i < count; i++) indices[i] = i;
-
-    switch(method) {
-        case 0: naive_sort(values, colors, indices, count); break;
-        case 1: heap_topk(values, colors, indices, count, K); break;
-        case 2: bitonic_topk(values, colors, indices, count, K); break;
-        case 3: quickselect_topk(values, colors, indices, count, K); break;
-        default: naive_sort(values, colors, indices, count); break;
-    }
-
-    int useK = min(K, count);
-    for (int i = 0; i < useK; i++)
-        topK_indices[i] = indices[i]; // return correct local indices
 }

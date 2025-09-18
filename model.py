@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from pytorch_msssim import MS_SSIM
+from pytorch_msssim import ssim
 from renderer_wrapper import GaussianRenderer
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
@@ -50,10 +51,10 @@ class ImageGSOptimizer:
         os.makedirs(save_dir, exist_ok=True)
 
         # Default parameters (can be overridden)
-        self.N_total = kwargs.get('N_total', 1000)
+        self.N_total = kwargs.get('N_total', 10000)
         self.steps = kwargs.get('steps', 1500)
-        self.H_t = kwargs.get('H_t', 32)
-        self.W_t = kwargs.get('W_t', 32)
+        self.H_t = kwargs.get('H_t', 16)
+        self.W_t = kwargs.get('W_t', 16)
         self.K = kwargs.get('K', 10)
         self.max_G_per_tile = kwargs.get('max_G_per_tile', 100)
         self.lambda_init = kwargs.get('lambda_init', 0.3)
@@ -91,7 +92,6 @@ class ImageGSOptimizer:
 
         means = torch.stack([xs.float(), ys.float()], dim=1).to(self.device)
         rotations = torch.zeros(N_init, device=self.device)
-        # log_scales = torch.full((N_init,2), math.log(self.init_scale_pixels), device=self.device)
         inv_scales = torch.full((N_init,2), 1.0/self.init_scale_pixels, device=self.device)
         colors = self.target_image[ys, xs, :].to(self.device).float()
 
@@ -157,7 +157,6 @@ class ImageGSOptimizer:
 
                     new_means = torch.stack([xs_add.float(), ys_add.float()], dim=1).to(self.device)
                     new_rot = torch.zeros(n_add, device=self.device)
-                    # new_log_sc = torch.full((n_add,2), math.log(self.init_scale_pixels), device=self.device)
                     new_log_sc = torch.full((n_add,2), 1.0/self.init_scale_pixels, device=self.device)
                     new_colors = self.target_image[ys_add, xs_add, :].to(self.device).float()
 
@@ -193,13 +192,22 @@ class ImageGSOptimizer:
         axes[0].axis('off')
         
         axes[1].set_facecolor('black')
-        #scales = torch.exp(inv_scales).detach().cpu().numpy()
         scales = 1.0 / inv_scales.detach().cpu().numpy()
         means_np = means.detach().cpu().numpy()
         rotations_np = rotations.detach().cpu().numpy()
         colors_np = colors.detach().cpu().numpy()
         
-        for (x, y), (sx, sy), theta, color in zip(means_np, scales, rotations_np, colors_np):
+        # Sample 20% of the Gaussians
+        N = means_np.shape[0]
+        sample_size = max(1, N // 5)  # at least one
+        sample_indices = np.random.choice(N, sample_size, replace=False)
+
+        for idx in sample_indices:
+            (x, y) = means_np[idx]
+            (sx, sy) = scales[idx]
+            theta = rotations_np[idx]
+            color = colors_np[idx]
+
             ell = Ellipse((x, y), width=6*sx, height=6*sy,
                         angle=theta*180/math.pi, edgecolor=color, facecolor=color, alpha=0.5)
             axes[1].add_patch(ell)
@@ -224,21 +232,19 @@ class ImageGSOptimizer:
             plt.savefig(os.path.join(self.save_dir,'visualization_step_'+str(step)+'.png')) 
             plt.close(fig)
 
-# ------------------------------
-# Example usage
-# ------------------------------
+
 if __name__ == "__main__":
 
     device='cuda'
 
     # Load your image
-    img_path = "./kodak/kodim17.png"  # replace with your file path
-    img_pil = Image.open(img_path).convert("RGB")  # ensure 3 channels
+    img_path = "./kodak/kodim17.png"  
+    img_pil = Image.open(img_path).convert("RGB")  
 
     # Transform to tensor in [0,1] and send to device
     transform = T.ToTensor()  # converts to [C,H,W] float in [0,1]
     target_image = transform(img_pil).permute(1, 2, 0).to(device)  # [H,W,3]
 
     optimizer = ImageGSOptimizer(target_image, save_dir="gs_output", device=device,
-                                 N_total=10000, steps=1500, H_t=16, W_t=16, add_interval=250)
+                                 N_total=3000, steps=2000, H_t=16, W_t=16, add_interval=250)
     means, rotations, inv_scales, colors, debug = optimizer.optimize()

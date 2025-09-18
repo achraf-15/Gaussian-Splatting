@@ -46,10 +46,10 @@ __global__ void findTileGaussianCorrespondence(
         float g_x = gaussian_means[g * 2 + 0];
         float g_y = gaussian_means[g * 2 + 1];
 
-        float log_sx = gaussian_inv_scales[g * 2 + 0];
-        float log_sy = gaussian_inv_scales[g * 2 + 1];
-        float sx =1.0f / log_sx;
-        float sy =1.0f / log_sy;
+        float inv_sx = gaussian_inv_scales[g * 2 + 0];
+        float inv_sy = gaussian_inv_scales[g * 2 + 1];
+        float sx =1.0f / inv_sx;
+        float sy =1.0f / inv_sy;
 
         float radius = 3.f * fmaxf(sx, sy);
 
@@ -103,11 +103,12 @@ __global__ void renderTile(
 
     const int* g_indices = &tile_gaussian_indices[tile_idx * max_G_per_tile];
 
-    extern __shared__ float sdata[]; // size in bytes set by kernel launch
-    float* s_mu     = sdata;                                           // 2 * max
-    float* s_theta  = s_mu     + 2 * max_G_per_tile;                   // 1 * max
-    float* s_inv    = s_theta  +    max_G_per_tile;                    // 2 * max
-    float* s_col    = s_inv    + 2 * max_G_per_tile;                   // 3 * max
+    extern __shared__ float sdata[];
+    float* s_mu    = sdata;                                 // 2*max_G_per_tile
+    float* s_theta = s_mu + 2*max_G_per_tile;               // 1*max
+    float* s_inv   = s_theta + max_G_per_tile;             // 2*max
+    float* s_col   = s_inv + 2*max_G_per_tile;             // 3*max
+    
 
     // Cooperative load of tile Gaussians into shared memory; Each thread in the block participates in loading the count Gaussians into shared memory 
     int blockThreads = blockDim.x * blockDim.y;
@@ -127,7 +128,7 @@ __global__ void renderTile(
             s_col[i*3 + 1]= 0.0f;
             s_col[i*3 + 2]= 0.0f;
         } else {
-            // load mean & rotation & log-scales (compute inv)
+            // load mean & rotation & inv-scales 
             float mu_x = gaussian_means[g*2 + 0];
             float mu_y = gaussian_means[g*2 + 1];
             float theta = gaussian_rotations[g];
@@ -147,10 +148,10 @@ __global__ void renderTile(
     __syncthreads(); // all shared data loaded
 
 
-    float g_values[MAX_G_PER_TILE];          // MAX_G_PER_TILE compile-time limit
-    float g_colors[MAX_G_PER_TILE * 3];
+    float g_values[MAX_G_PER_TILE];          
+    int topK_indices[MAX_G_PER_TILE]; 
     
-    // Evaluate Gaussians in this tile for this pixel (DEBUG GUARDS)
+    // Evaluate Gaussians in this tile for this pixel 
     for (int i = 0; i < count; ++i) {
         // read parameters from shared memory (cheap)
         float mu_x = s_mu[i*2 + 0];
@@ -162,14 +163,11 @@ __global__ void renderTile(
         float val = gaussian_eval((float)x, (float)y, mu_x, mu_y, theta, inv_sx, inv_sy);
         g_values[i] = val;
 
-        // copy color from shared memory into per-thread local array (topk_selector expects writable colors)
-        g_colors[i*3 + 0] = s_col[i*3 + 0];
-        g_colors[i*3 + 1] = s_col[i*3 + 1];
-        g_colors[i*3 + 2] = s_col[i*3 + 2];
+        topK_indices[i] = i;
     }
 
-    int topK_indices[MAX_G_PER_TILE]; // temporary local storage
-    topk_selector(g_values, g_colors, topK_indices, count, K, 2); // 0=naive, 1=heap, 2=bitonic, 3=quickselect
+    topk_selector(g_values, topK_indices, count, K); 
+    
 
     // Write top-K **local indices** to global memory
     int useK = min(K, count);
@@ -182,17 +180,19 @@ __global__ void renderTile(
             pixel_topk_ptr[i] = -1; // mark invalid
             continue;
         }
-        pixel_topk_ptr[i] = local_idx; // store local index, NOT global
+        pixel_topk_ptr[i] = topK_indices[i]; // store local index, NOT global
     }
  
     // Aggregate colors
     float sum_weights = 0.0f;
     float sum_colors[3] = {0.0f, 0.0f, 0.0f};
     for (int i = 0; i < useK; i++) {
-        sum_weights += g_values[i];
-        sum_colors[0] += g_values[i] * g_colors[i * 3 + 0];
-        sum_colors[1] += g_values[i] * g_colors[i * 3 + 1];
-        sum_colors[2] += g_values[i] * g_colors[i * 3 + 2];
+        int idx = topK_indices[i];
+        float val = g_values[idx];
+        sum_weights += val;
+        sum_colors[0] += val * s_col[idx*3+0];
+        sum_colors[1] += val * s_col[idx*3+1];
+        sum_colors[2] += val * s_col[idx*3+2];
     }
 
     if (sum_weights > 1e-8f) {
@@ -279,8 +279,6 @@ __global__ void renderTileBackward(
             s_mu[i*2 + 0] = mu_x;
             s_mu[i*2 + 1] = mu_y;
             s_theta[i]    = theta;
-            // s_inv[i*2 + 0]= inv_sx;
-            // s_inv[i*2 + 1]= inv_sy;
             s_inv[i*2 + 0]= inv_sx;
             s_inv[i*2 + 1]= inv_sy;
             s_col[i*3 + 0] = gaussian_colors[g*3 + 0];
@@ -385,7 +383,6 @@ __global__ void renderTileBackward(
 // Wrappers
 // ============================================================
 
-
 // Wrapper functions for PyTorch
 void find_tile_gaussian_correspondence_wrapper(
     torch::Tensor gaussian_means,
@@ -406,7 +403,6 @@ void find_tile_gaussian_correspondence_wrapper(
     int* tile_gaussian_indices_ptr = tile_gaussian_indices.data_ptr<int>();
     int* tile_gaussian_counts_ptr = tile_gaussian_counts.data_ptr<int>();
 
-    
     // Compute tile counts
     int n_tiles_x = (W + W_t - 1) / W_t;
     int n_tiles_y = (H + H_t - 1) / H_t;
@@ -465,9 +461,8 @@ void render_tile_wrapper(
     dim3 block(16, 16);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
     
-    // compute shared memory bytes required by renderTile
-    size_t shared_floats = (size_t)8 * (size_t)max_G_per_tile; // 8 floats per gaussian (2 mu + 1 theta + 2 inv + 3 color)
-    size_t shared_bytes = shared_floats * sizeof(float);
+    // Shared memory: 2+1+2+3 floats per Gaussian = 8 floats per Gaussian
+    size_t shared_bytes = sizeof(float) * 8 * max_G_per_tile;
 
     renderTile<<<grid, block, shared_bytes>>>(
         gaussian_means_ptr,
@@ -488,7 +483,6 @@ void render_tile_wrapper(
     );
     //cudaDeviceSynchronize();
 }
-
 
 // Wrapper for backward pass
 void render_tile_backward_wrapper(
@@ -558,11 +552,9 @@ void render_tile_backward_wrapper(
     //cudaDeviceSynchronize();
 }
 
-
 // Update PyTorch binding
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("find_tile_gaussian_correspondence", &find_tile_gaussian_correspondence_wrapper, "Find tile-Gaussian correspondence");
     m.def("render_tile", &render_tile_wrapper, "Render tile");
     m.def("render_tile_backward", &render_tile_backward_wrapper, "Render tile backward");
 }
-
