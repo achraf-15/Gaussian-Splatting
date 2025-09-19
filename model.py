@@ -39,6 +39,32 @@ def sample_pixels_from_prob(prob_map, n_samples, replace=False):
     ys, xs = (idx // W).long(), (idx % W).long()
     return xs, ys, idx
 
+def save_final_rendered_image(renderer, means, rotations, inv_scales, colors, debug, save_dir="output"):
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Get final metrics
+    final_step = max(debug.keys())
+    metrics = debug[final_step]
+
+    # Render final image
+    final_rendered = renderer(means, rotations, inv_scales, colors).detach().cpu().clamp(0.0, 1.0)
+
+    # Convert to 8-bit per channel image
+    final_image_uint8 = (final_rendered.numpy() * 255).astype("uint8")
+    img_pil = Image.fromarray(final_image_uint8)
+
+    # Build safe filename
+    filename = (
+        f"Rendered_Ng{metrics['Ng']}_BPP{metrics['bpp']:.4f}_"
+        f"PSNR{metrics['PSNR']:.2f}_MSSSIM{metrics['MS-SSIM']:.4f}.png"
+    )
+    filename = filename.replace(" ", "_").replace(":", "-")
+    output_path = os.path.join(save_dir, filename)
+
+    # Save
+    img_pil.save(output_path)
+    print(f"Final rendered image saved to: {output_path}")
+
 # ------------------------------
 # Main Optimizer Class
 # ------------------------------
@@ -170,10 +196,10 @@ class ImageGSOptimizer:
 
             # Save debug info
             if step % visualize_interval == 0 or step == 1 or step == self.steps:
-                saved_debug[step] = {"loss": loss.item(), "N": N_current, "rendered": rendered.detach().cpu()}
+                saved_debug[step] =  self.evaluate(rendered, N_current)
                 self.visualize(step, means, inv_scales, rotations, colors, rendered, plot=False)
 
-        self.visualize('Final', means, inv_scales, rotations, colors, rendered, plot=True)
+        #self.visualize('Final', means, inv_scales, rotations, colors, rendered, plot=True)
 
         return means, rotations, inv_scales, colors, saved_debug
     
@@ -199,7 +225,7 @@ class ImageGSOptimizer:
         
         # Sample 20% of the Gaussians
         N = means_np.shape[0]
-        sample_size = max(1, N // 5)  # at least one
+        sample_size = max(1, N // 10)  # at least one
         sample_indices = np.random.choice(N, sample_size, replace=False)
 
         for idx in sample_indices:
@@ -232,6 +258,27 @@ class ImageGSOptimizer:
             plt.savefig(os.path.join(self.save_dir,'visualization_step_'+str(step)+'.png')) 
             plt.close(fig)
 
+    def evaluate(self, rendered, N_current):
+        # Ensure rendered is clamped and float
+        rendered = rendered.detach().cpu().clamp(0.0, 1.0)
+        target = self.target_image.detach().cpu().clamp(0.0, 1.0)
+
+        # PSNR
+        mse = F.mse_loss(rendered, target).item()
+        psnr = 10 * math.log10(1.0 / (mse + 1e-12))
+
+        # MS-SSIM
+        rendered_tensor = rendered.permute(2,0,1).unsqueeze(0)  # [1,C,H,W]
+        target_tensor = target.permute(2,0,1).unsqueeze(0)
+        ms_ssim_val = self.ms_ssim_fn(rendered_tensor, target_tensor).item()
+
+        # Bits per pixel (bpp)
+        bytes_per_float = 4  # float32
+        total_bytes = N_current* (2 + 1 + 2 + 3) * bytes_per_float
+        bpp = total_bytes / (self.H * self.W)
+
+        return {"PSNR": psnr, "MS-SSIM": ms_ssim_val, "bpp": bpp, "Ng": N_current}
+
 
 if __name__ == "__main__":
 
@@ -246,5 +293,7 @@ if __name__ == "__main__":
     target_image = transform(img_pil).permute(1, 2, 0).to(device)  # [H,W,3]
 
     optimizer = ImageGSOptimizer(target_image, save_dir="gs_output", device=device,
-                                 N_total=20000, steps=1500, H_t=16, W_t=16, add_interval=250)
+                                 N_total=10000, steps=1500, H_t=16, W_t=16, add_interval=250)
     means, rotations, inv_scales, colors, debug = optimizer.optimize()
+
+    save_final_rendered_image(optimizer.renderer, means, rotations, inv_scales, colors, debug, save_dir="gs_output")

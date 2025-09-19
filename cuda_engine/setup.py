@@ -6,7 +6,7 @@ setup(
     packages=["cuda_engine"],  # declare package
     ext_modules=[
         CUDAExtension(
-            name="cuda_engine.gaussian_renderer_cuda",  # fully qualified module name
+            name="cuda_engine.gaussian_renderer_cuda",  
             sources=["cuda_engine/gaussian_renderer.cu"],
             extra_compile_args={
                 "cxx": ["-O3"],

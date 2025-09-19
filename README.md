@@ -7,5 +7,5 @@ This repository contains my implementation of **[Image-GS: Content-Adaptive Imag
 - Integrated with **PyTorch** for optimization and the rest of the training pipeline.  
 
 ## Reference
-If you use this code, please cite the original paper:
+If you use this code, please cite the original paper.
 
