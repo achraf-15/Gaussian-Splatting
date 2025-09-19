@@ -140,7 +140,7 @@ class ImageGSOptimizer:
             # Clamp physically valid ranges
             with torch.no_grad():
                 # inv_scales should be positive (paper uses 1/s). Clamp to avoid sign flips.
-                inv_scales.clamp_(min=1e-4, max=1.0)  # min corresponds to large s, max to s=1
+                inv_scales.clamp_(min=1e-1, max=1.0)  # min corresponds to large s, max to s=1
                 # rotations in [0, pi]
                 rotations[:] = torch.remainder(rotations, math.pi)
                  # colors in [0,1]
@@ -238,7 +238,7 @@ if __name__ == "__main__":
     device='cuda'
 
     # Load your image
-    img_path = "./kodak/kodim17.png"  
+    img_path = "./kodak/kodim23.png"  
     img_pil = Image.open(img_path).convert("RGB")  
 
     # Transform to tensor in [0,1] and send to device
@@ -246,5 +246,5 @@ if __name__ == "__main__":
     target_image = transform(img_pil).permute(1, 2, 0).to(device)  # [H,W,3]
 
     optimizer = ImageGSOptimizer(target_image, save_dir="gs_output", device=device,
-                                 N_total=3000, steps=2000, H_t=16, W_t=16, add_interval=250)
+                                 N_total=20000, steps=1500, H_t=16, W_t=16, add_interval=250)
     means, rotations, inv_scales, colors, debug = optimizer.optimize()

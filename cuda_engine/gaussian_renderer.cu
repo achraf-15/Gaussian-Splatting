@@ -48,10 +48,22 @@ __global__ void findTileGaussianCorrespondence(
 
         float inv_sx = gaussian_inv_scales[g * 2 + 0];
         float inv_sy = gaussian_inv_scales[g * 2 + 1];
-        float sx =1.0f / inv_sx;
-        float sy =1.0f / inv_sy;
+        float theta = gaussian_rotations[g];
 
-        float radius = 3.f * fmaxf(sx, sy);
+        // Compute eigenvalues of covariance matrix
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+        float inv_var_x = inv_sx * inv_sx;
+        float inv_var_y = inv_sy * inv_sy;
+
+        // Σ⁻¹ = R diag(inv_var_x, inv_var_y) R^T
+        float m00 = cos_t*cos_t*inv_var_x + (-sin_t)*(-sin_t)*inv_var_y;
+        float m01 = cos_t*sin_t*inv_var_x + (-sin_t)*cos_t*inv_var_y;
+        float m11 = sin_t*sin_t*inv_var_x + cos_t*cos_t*inv_var_y;
+
+        // Covariance matrix: Σ = inverse of Σ⁻¹
+        float det = m00*m11 - m01*m01;
+        float radius = 3.f * sqrtf(fmaxf(m11 / det, m00 / det)); // 3σ of largest eigenvalue
 
         // Check intersection with tile
         bool intersects =
